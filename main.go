@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
+	_ "embed"
 	"errors"
+	"flag"
 	"fmt"
 	"github.com/xuri/excelize/v2"
+	"io"
 	"io/fs"
 	"math"
+	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,147 +31,224 @@ const (
 	lScheduleStart = 9
 )
 
-const debug = false
+var (
+	debug = false
+)
+
+//go:embed index.html
+var indexHtml string
+
+func handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		//w.Header().Add("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, indexHtml)
+		return
+	} else if r.Method == http.MethodPost {
+		err := r.ParseMultipartForm(32 << 20)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintln(w, err)
+			fmt.Println(err)
+			return
+		}
+		input, header, err := r.FormFile("file")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintln(w, err)
+			fmt.Println(err)
+			return
+		}
+		defer input.Close()
+
+		// FIXME(tikinang): Year.
+		buf := new(bytes.Buffer)
+		err = convert(input, buf, 2024)
+		if err != nil {
+			fmt.Println("convert error:", err)
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(w, err)
+			return
+		}
+
+		w.Header().Add("Content-Type", "application/octet-stream")
+		w.Header().Add("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, header.Filename))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, buf)
+	}
+}
 
 func main() {
+	var (
+		cmd string
+		dir string
+	)
+	flag.StringVar(&cmd, "cmd", "server", "server or batch update from dir with .xlsx files (server|cli)")
+	flag.StringVar(&dir, "dir", "/home/tikinang/documents/gabca_evidence", "dir with .xlsx files")
+	flag.Parse()
+
+	cleanDir := fmt.Sprintf("%s_clean", dir)
+
 	var err error
-	err = os.RemoveAll("/home/tikinang/documents/gabca_evidence_clean")
+	err = os.RemoveAll(cleanDir)
 	if err != nil {
 		panic(err)
 	}
 
-	err = os.MkdirAll("/home/tikinang/documents/gabca_evidence_clean", 0755)
+	err = os.MkdirAll(cleanDir, 0755)
 	if err != nil {
 		panic(err)
 	}
 
-	err = filepath.WalkDir("/home/tikinang/documents/gabca_evidence", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(d.Name(), ".xlsx") {
-			return nil
-		}
-		fmt.Println("processing:", d.Name())
-		f, err := excelize.OpenFile(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
-		rows, err := f.GetRows("VZOR")
-		if err != nil {
-			return err
-		}
-
-		var weeks []*WeekSchedule
-		var week *WeekSchedule
-		for i, row := range rows {
-			if i < lScheduleStart {
-				continue
-			}
-
-			if debug {
-				fmt.Println()
-			}
-
-			if len(row) < 4 {
-				if debug {
-					fmt.Println("skipping, short row:", i+1)
-				}
-				continue
-			}
-
-			if debug {
-				fmt.Println("row number:", i+1)
-				printRow(row)
-			}
-
-			if isEmpty(row[iFrom1]) && isEmpty(row[iTo1]) && isEmpty(row[iFrom2]) && isEmpty(row[iTo2]) {
-				if debug {
-					fmt.Println("skipping, no schedule:", i+1)
-				}
-				continue
-			}
-
-			schedule, err := getDaySchedule(row)
+	switch cmd {
+	case "server":
+		err = http.ListenAndServe(":8080", http.HandlerFunc(handle))
+	case "cli":
+		err = filepath.WalkDir(dir, func(walkPath string, d fs.DirEntry, err error) error {
 			if err != nil {
-				fmt.Println("error getting day schedule:", err)
-				printRow(row)
-				continue
+				return err
 			}
-			if debug {
-				fmt.Println(schedule)
+			if d.IsDir() {
+				return nil
 			}
-
-			if schedule.Weekday == time.Monday {
-				if week != nil {
-					weeks = append(weeks, week)
-				}
-				week = &WeekSchedule{
-					Days: make([]*DaySchedule, 7),
-				}
+			if !strings.HasSuffix(d.Name(), ".xlsx") {
+				return nil
 			}
-			if week != nil {
-				week.Days[schedule.Weekday] = schedule
+			fmt.Println("processing:", d.Name())
+
+			source, err := os.Open(walkPath)
+			if err != nil {
+				return err
 			}
-		}
+			defer source.Close()
 
-		if week != nil {
-			weeks = append(weeks, week)
-		}
-
-		var prev *string
-		for i, w := range weeks {
-			if debug {
-				fmt.Println(w)
+			target, err := os.Create(path.Join(cleanDir, d.Name()))
+			if err != nil {
+				return err
 			}
-			this := fmt.Sprint(w)
-			if prev != nil && *prev != this && i != len(weeks)-1 {
-				fmt.Printf("MISMATCH!\n%s\n%s\n", *prev, this)
-			}
-			prev = &this
-		}
+			defer target.Close()
 
-		if len(weeks) == 0 {
-			fmt.Println("NO SCHEDULE!")
-			return nil
-		}
-
-		name, err := f.GetCellValue("Zaměstnanec", "B1")
-		if err != nil {
-			return err
-		}
-		surname, err := f.GetCellValue("Zaměstnanec", "B2")
-		if err != nil {
-			return err
-		}
-		position, err := f.GetCellValue("Zaměstnanec", "B3")
-		if err != nil {
-			return err
-		}
-
-		info := &Info{
-			Schedule: weeks[1],
-			Filename: d.Name(),
-			Worker:   fmt.Sprintf("%s %s", name, surname),
-			Position: strings.Join(strings.Fields(position), " "),
-		}
-
-		// FIXME(tikinang): Year config. Debug config.
-		err = writeExcel(2024, info)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+			return convert(source, target, 2024)
+		})
+	default:
+		panic("invalid cmd")
+	}
 	if err != nil {
 		panic(err)
 	}
+}
+
+func convert(reader io.Reader, writer io.Writer, year int) error {
+	f, err := excelize.OpenReader(reader)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	rows, err := f.GetRows("VZOR")
+	if err != nil {
+		return err
+	}
+
+	var weeks []*WeekSchedule
+	var week *WeekSchedule
+	for i, row := range rows {
+		if i < lScheduleStart {
+			continue
+		}
+
+		if debug {
+			fmt.Println()
+		}
+
+		if len(row) < 4 {
+			if debug {
+				fmt.Println("skipping, short row:", i+1)
+			}
+			continue
+		}
+
+		if debug {
+			fmt.Println("row number:", i+1)
+			printRow(row)
+		}
+
+		if isEmpty(row[iFrom1]) && isEmpty(row[iTo1]) && isEmpty(row[iFrom2]) && isEmpty(row[iTo2]) {
+			if debug {
+				fmt.Println("skipping, no schedule:", i+1)
+			}
+			continue
+		}
+
+		schedule, err := getDaySchedule(row)
+		if err != nil {
+			fmt.Println("error getting day schedule:", err)
+			printRow(row)
+			continue
+		}
+		if debug {
+			fmt.Println(schedule)
+		}
+
+		if schedule.Weekday == time.Monday {
+			if week != nil {
+				weeks = append(weeks, week)
+			}
+			week = &WeekSchedule{
+				Days: make([]*DaySchedule, 7),
+			}
+		}
+		if week != nil {
+			week.Days[schedule.Weekday] = schedule
+		}
+	}
+
+	if week != nil {
+		weeks = append(weeks, week)
+	}
+
+	var prev *string
+	for i, w := range weeks {
+		if debug {
+			fmt.Println(w)
+		}
+		this := fmt.Sprint(w)
+		if prev != nil && *prev != this && i != len(weeks)-1 {
+			fmt.Printf("MISMATCH!\n%s\n%s\n", *prev, this)
+		}
+		prev = &this
+	}
+
+	if len(weeks) == 0 {
+		fmt.Println("NO SCHEDULE!")
+		return nil
+	}
+
+	name, err := f.GetCellValue("Zaměstnanec", "B1")
+	if err != nil {
+		return err
+	}
+	surname, err := f.GetCellValue("Zaměstnanec", "B2")
+	if err != nil {
+		return err
+	}
+	position, err := f.GetCellValue("Zaměstnanec", "B3")
+	if err != nil {
+		return err
+	}
+
+	info := &Info{
+		Schedule: weeks[1],
+		Worker:   fmt.Sprintf("%s %s", name, surname),
+		Position: strings.Join(strings.Fields(position), " "),
+	}
+
+	err = writeExcel(writer, year, info)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 type WeekSchedule struct {
@@ -200,7 +283,6 @@ type FromTo struct {
 
 type Info struct {
 	Schedule *WeekSchedule
-	Filename string
 	Worker   string
 	Position string
 }
@@ -332,7 +414,7 @@ var months = [12]string{
 	"prosinec",
 }
 
-func writeExcel(year int, info *Info) error {
+func writeExcel(writer io.Writer, year int, info *Info) error {
 	f := excelize.NewFile()
 	defer f.Close()
 
@@ -455,7 +537,7 @@ func writeExcel(year int, info *Info) error {
 		return err
 	}
 
-	err = f.SaveAs(fmt.Sprintf("/home/tikinang/documents/gabca_evidence_clean/%s", info.Filename))
+	_, err = f.WriteTo(writer)
 	if err != nil {
 		return err
 	}
