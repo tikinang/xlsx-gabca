@@ -36,4 +36,4 @@ server:
     # init:
     #  - rm -rf ./cache
     # how to start your application
-    start: ./server
+    start: ./server -year 2024 -cmd server -debug false

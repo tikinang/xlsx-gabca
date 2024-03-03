@@ -63,7 +63,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 		// FIXME(tikinang): Year.
 		buf := new(bytes.Buffer)
-		err = convert(input, buf, 2024)
+		err = convert(input, buf, "upload", 2024)
 		if err != nil {
 			fmt.Println("convert error:", err)
 			w.WriteHeader(http.StatusBadRequest)
@@ -87,6 +87,7 @@ func main() {
 	flag.StringVar(&cmd, "cmd", "server", "server or batch update from dir with .xlsx files (server|cli)")
 	flag.StringVar(&dir, "dir", "/home/tikinang/documents/gabca_evidence", "dir with .xlsx files")
 	flag.IntVar(&year, "year", 2024, "evidence year")
+	flag.BoolVar(&debug, "debug", false, "print extra information")
 	flag.Parse()
 
 	cleanDir := fmt.Sprintf("%s_clean", dir)
@@ -105,6 +106,9 @@ func main() {
 	switch cmd {
 	case "server":
 		err = http.ListenAndServe(":8080", http.HandlerFunc(handle))
+		if err != nil {
+			panic(err)
+		}
 	case "cli":
 		err = filepath.WalkDir(dir, func(walkPath string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -130,22 +134,25 @@ func main() {
 			}
 			defer target.Close()
 
-			err = convert(source, target, 2024)
+			err = convert(source, target, d.Name(), 2024)
 			if err != nil {
 				return err
 			}
 
 			return nil
 		})
+		if err != nil {
+			panic(err)
+		}
+		printRowNoIndex(weirdSchedules)
 	default:
 		panic("invalid cmd")
 	}
-	if err != nil {
-		panic(err)
-	}
 }
 
-func convert(reader io.Reader, writer io.Writer, year int) error {
+var weirdSchedules []string
+
+func convert(reader io.Reader, writer io.Writer, filename string, year int) error {
 	f, err := excelize.OpenReader(reader)
 	if err != nil {
 		return err
@@ -158,7 +165,9 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 	}
 
 	var weeks []*WeekSchedule
-	var week *WeekSchedule
+	week := &WeekSchedule{
+		Days: make([]*DaySchedule, 7),
+	}
 	for i, row := range rows {
 		if i < lScheduleStart {
 			continue
@@ -182,7 +191,7 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 
 		if isEmpty(row[iFrom1]) && isEmpty(row[iTo1]) && isEmpty(row[iFrom2]) && isEmpty(row[iTo2]) {
 			if debug {
-				fmt.Println("skipping, no schedule:", i+1)
+				fmt.Println("skipping day, no schedule:", i+1)
 			}
 			continue
 		}
@@ -198,16 +207,14 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 		}
 
 		if schedule.Weekday == time.Monday {
-			if week != nil {
+			if week.FilledSchedules() > 0 {
 				weeks = append(weeks, week)
 			}
 			week = &WeekSchedule{
 				Days: make([]*DaySchedule, 7),
 			}
 		}
-		if week != nil {
-			week.Days[schedule.Weekday] = schedule
-		}
+		week.Days[schedule.Weekday] = schedule
 	}
 
 	if week != nil {
@@ -221,13 +228,19 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 		}
 		this := fmt.Sprint(w)
 		if prev != nil && *prev != this && i != len(weeks)-1 {
-			fmt.Printf("SCHEDULE MISMATCH!\n%s\n%s\n", *prev, this)
+			if debug {
+				fmt.Printf("SCHEDULE MISMATCH!\n%s\n%s\n", *prev, this)
+			}
+			weirdSchedules = append(weirdSchedules, filename+": různé rozvrhy (sudé/liché týdny) nejsou podporovány, případně zkontrolujte list VZOR")
 		}
 		prev = &this
 	}
 
 	if len(weeks) == 0 {
-		fmt.Println("NO SCHEDULE!")
+		if debug {
+			fmt.Println("NO SCHEDULE!")
+		}
+		weirdSchedules = append(weirdSchedules, filename+": rozvrh nebyl nalezen, zkontrolujte list VZOR")
 		return nil
 	}
 
@@ -244,8 +257,21 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 		return err
 	}
 
+	var pickWeek *WeekSchedule
+	for _, w := range weeks {
+		if pickWeek == nil {
+			if w.FilledSchedules() > 0 {
+				pickWeek = w
+			}
+			continue
+		}
+		if w.FilledSchedules() > pickWeek.FilledSchedules() {
+			pickWeek = w
+		}
+	}
+
 	info := &Info{
-		Schedule: weeks[1],
+		Schedule: pickWeek,
 		Worker:   fmt.Sprintf("%s %s", name, surname),
 		Position: strings.Join(strings.Fields(position), " "),
 	}
@@ -260,6 +286,16 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 
 type WeekSchedule struct {
 	Days []*DaySchedule
+}
+
+func (d *WeekSchedule) FilledSchedules() int {
+	var x int
+	for _, day := range d.Days {
+		if day != nil {
+			x++
+		}
+	}
+	return x
 }
 
 type DaySchedule struct {
@@ -297,6 +333,12 @@ type Info struct {
 func printRow(row []string) {
 	for j, cell := range row {
 		fmt.Println(j, cell)
+	}
+}
+
+func printRowNoIndex(row []string) {
+	for _, cell := range row {
+		fmt.Println(cell)
 	}
 }
 
