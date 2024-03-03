@@ -80,11 +80,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	var (
-		cmd string
-		dir string
+		cmd  string
+		dir  string
+		year int
 	)
 	flag.StringVar(&cmd, "cmd", "server", "server or batch update from dir with .xlsx files (server|cli)")
 	flag.StringVar(&dir, "dir", "/home/tikinang/documents/gabca_evidence", "dir with .xlsx files")
+	flag.IntVar(&year, "year", 2024, "evidence year")
 	flag.Parse()
 
 	cleanDir := fmt.Sprintf("%s_clean", dir)
@@ -128,7 +130,12 @@ func main() {
 			}
 			defer target.Close()
 
-			return convert(source, target, 2024)
+			err = convert(source, target, 2024)
+			if err != nil {
+				return err
+			}
+
+			return nil
 		})
 	default:
 		panic("invalid cmd")
@@ -214,7 +221,7 @@ func convert(reader io.Reader, writer io.Writer, year int) error {
 		}
 		this := fmt.Sprint(w)
 		if prev != nil && *prev != this && i != len(weeks)-1 {
-			fmt.Printf("MISMATCH!\n%s\n%s\n", *prev, this)
+			fmt.Printf("SCHEDULE MISMATCH!\n%s\n%s\n", *prev, this)
 		}
 		prev = &this
 	}
@@ -303,15 +310,15 @@ func parseTime(val string) (time.Time, error) {
 		clock = parts[0]
 		a, err := strconv.ParseFloat("0."+parts[1], 64)
 		if err != nil {
-			return time.Time{}, err
+			return zeroTime, err
 		}
 		leftover = time.Duration(math.Round(a))
 	} else {
-		return time.Time{}, fmt.Errorf("parts len invalid: %d, for %s", len(parts), val)
+		return zeroTime, fmt.Errorf("parts len invalid: %d, for %s", len(parts), val)
 	}
 	t, err := time.Parse(time.TimeOnly, clock)
 	if err != nil {
-		return time.Time{}, err
+		return zeroTime, err
 	}
 	return t.Add(leftover * time.Second), nil
 }
@@ -414,9 +421,46 @@ var months = [12]string{
 	"prosinec",
 }
 
+type MonthSummary struct {
+	DaysInMonth int
+	TotalTime   time.Time
+}
+
+var zeroTime time.Time
+
 func writeExcel(writer io.Writer, year int, info *Info) error {
 	f := excelize.NewFile()
 	defer f.Close()
+
+	styleId1, err := f.NewStyle(&excelize.Style{
+		Border: []excelize.Border{
+			{
+				Type:  "left",
+				Color: "000000",
+				Style: 1,
+			},
+			{
+				Type:  "bottom",
+				Color: "000000",
+				Style: 1,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	styleId2, err := f.NewStyle(&excelize.Style{
+		Border: []excelize.Border{
+			{
+				Type:  "bottom",
+				Color: "000000",
+				Style: 1,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
 
 	var (
 		cursor time.Month
@@ -442,42 +486,48 @@ func writeExcel(writer io.Writer, year int, info *Info) error {
 		return nil
 	}
 
-	var err error
+	var totalTime time.Time
+	allSheets := make(map[time.Month]MonthSummary)
 	for t = time.Date(year, 1, 1, 0, 0, 0, 0, prague); t.Year() == year; t = t.AddDate(0, 0, 1) {
 		if t.Month() != cursor {
+			if cursor != 0 {
+				allSheets[cursor] = MonthSummary{
+					DaysInMonth: t.AddDate(0, 0, -1).Day(),
+					TotalTime:   totalTime,
+				}
+				totalTime = zeroTime
+			}
 			cursor = t.Month()
 
 			_, err = f.NewSheet(sheet(cursor))
 			if err != nil {
 				return err
 			}
-		}
 
-		// info
-
-		err = cellInfo(1, "rok:", strconv.Itoa(year))
-		if err != nil {
-			return err
-		}
-		err = cellInfo(2, "měsíc:", strconv.Itoa(int(cursor)))
-		if err != nil {
-			return err
-		}
-		err = cellInfo(3, "jméno:", info.Worker)
-		if err != nil {
-			return err
-		}
-		err = cellInfo(4, "pozice a číslo:", info.Position)
-		if err != nil {
-			return err
-		}
-		err = cellInfo(6, "datum", "den", "příchod", "odchod", "příchod", "odchod", "hodin", "poznámka")
-		if err != nil {
-			return err
+			// info
+			err = cellInfo(1, "rok:", strconv.Itoa(year))
+			if err != nil {
+				return err
+			}
+			err = cellInfo(2, "měsíc:", strconv.Itoa(int(cursor)))
+			if err != nil {
+				return err
+			}
+			err = cellInfo(3, "jméno:", info.Worker)
+			if err != nil {
+				return err
+			}
+			err = cellInfo(4, "pozice a číslo:", info.Position)
+			if err != nil {
+				return err
+			}
+			err = cellInfo(6, "datum", "den", "příchod", "odchod", "příchod", "odchod", "hodin", "poznámka")
+			if err != nil {
+				return err
+			}
 		}
 
 		// days
-
 		err = cell("A", t.Format(time.DateOnly))
 		if err != nil {
 			return err
@@ -516,6 +566,7 @@ func writeExcel(writer io.Writer, year int, info *Info) error {
 			if err != nil {
 				return err
 			}
+			totalTime = totalTime.Add(day.Hours().Sub(zeroTime))
 		}
 
 		err = f.SetColWidth(sheet(cursor), "A", "A", 12)
@@ -527,6 +578,41 @@ func writeExcel(writer io.Writer, year int, info *Info) error {
 			return err
 		}
 		err = f.SetColWidth(sheet(cursor), "C", "H", 9)
+		if err != nil {
+			return err
+		}
+	}
+	allSheets[cursor] = MonthSummary{
+		DaysInMonth: t.AddDate(0, 0, -1).Day(),
+		TotalTime:   totalTime,
+	}
+
+	for c, s := range allSheets {
+		err = f.SetCellStyle(sheet(c), fmt.Sprintf("B%d", writeRowOffset), fmt.Sprintf("H%d", writeRowOffset+s.DaysInMonth), styleId1)
+		if err != nil {
+			return err
+		}
+		err = f.SetCellStyle(sheet(c), fmt.Sprintf("A%d", writeRowOffset), fmt.Sprintf("A%d", writeRowOffset+s.DaysInMonth), styleId2)
+		if err != nil {
+			return err
+		}
+
+		// celkový
+		err = f.SetCellValue(sheet(c), fmt.Sprintf("A%d", writeRowOffset+s.DaysInMonth+1), "součet odpracovaných hodin:")
+		if err != nil {
+			return err
+		}
+		err = f.SetCellValue(sheet(c), fmt.Sprintf("G%d", writeRowOffset+s.DaysInMonth+1), fmt.Sprintf("%.1f", s.TotalTime.Sub(zeroTime).Hours()))
+		if err != nil {
+			return err
+		}
+
+		// podpisy
+		err = f.SetCellValue(sheet(c), fmt.Sprintf("A%d", writeRowOffset+s.DaysInMonth+4), "podpis zaměstance:")
+		if err != nil {
+			return err
+		}
+		err = f.SetCellValue(sheet(c), fmt.Sprintf("E%d", writeRowOffset+s.DaysInMonth+4), "podpis ředitele:")
 		if err != nil {
 			return err
 		}
